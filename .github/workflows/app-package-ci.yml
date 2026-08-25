@@ -102,7 +102,19 @@ jobs:
           enable-cache: true
           cache-dependency-glob: backend/uv.lock
           python-version: ${{ inputs.python-version }}
-      - run: uv sync --locked
+      - name: Build extra flags
+        id: extras
+        shell: bash
+        run: |
+          flags=""
+          for e in ${{ inputs.extras }}; do flags="$flags --extra $e"; done
+          echo "flags=$flags" >> "$GITHUB_OUTPUT"
+      # Extras installed here too, not just in backend-tests: mypy needs to resolve whatever an
+      # extra's own module imports (cryptography, PIL) to typecheck the code that imports them
+      # lazily — found live: a bare `uv sync --locked` here left mypy unable to resolve
+      # `cryptography.fernet`/`PIL`, failing on import-not-found in code that is otherwise
+      # correctly typed.
+      - run: uv sync --locked ${{ steps.extras.outputs.flags }}
         working-directory: backend
       # `.` alone silently skips ../tests (a sibling root, not a subdirectory of backend/) —
       # every app package's tests live at the repo root (APP-DESIGN.md §2), so both paths are
