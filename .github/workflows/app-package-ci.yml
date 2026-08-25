@@ -1,0 +1,427 @@
+# =============================================================================================
+# THIS IS THE SINGLE SOURCE OF TRUTH FOR EVERY APP PACKAGE'S CI IN THIS ECOSYSTEM.
+#
+# Full specification: docs/APP-DESIGN.md §10.1 in each app package's own repo (e.g.
+# https://github.com/HjtDev/appkit/blob/main/docs/APP-DESIGN.md).
+#
+# App repos REFERENCE this workflow via `workflow_call` — they do not copy it. If a job here
+# needs to behave differently for your package, add or reuse an INPUT and set it from your
+# caller (.github/workflows/ci.yml in your own repo); do not fork this file into your own repo.
+# A forked copy is exactly the drift this design exists to prevent — improving CI once here
+# improves it for every app package that calls in.
+#
+# Written for appkit (app package #1), which exercises more of this workflow's edges than any
+# later app will: two install extras, no models (no migrations, no OpenAPI schema), zero
+# frontend runtime dependencies, and an npm workspace rooted at the repo root rather than at
+# frontend/. Every one of those edges is an input below, not a special case — a package with
+# none of them just uses the defaults.
+# =============================================================================================
+
+name: app-package-ci
+
+on:
+  workflow_call:
+    inputs:
+      package-name: # importable module name, e.g. appkit, notifications_app
+        required: true
+        type: string
+      python-version:
+        type: string
+        default: "3.14"
+      node-version:
+        type: string
+        default: "22"
+      has-frontend:
+        type: boolean
+        default: true
+      coverage-threshold:
+        type: number
+        default: 85
+      # Space-separated extra names, e.g. "crypto images". Empty string (the default) means the
+      # package declares no optional-dependencies — the bare-install leg is then skipped
+      # entirely, since the gate leg already IS the full, only install.
+      extras:
+        type: string
+        default: ""
+      postgres-db:
+        type: string
+        default: "test_db"
+      # Most app packages cache through Redis; appkit's own test settings use Django's
+      # LocMemCache (docs/CONTRACT.md §2.17) specifically to isolate appkit_clear_cache per
+      # xdist worker, so it sets this false.
+      needs-redis:
+        type: boolean
+        default: true
+      # False for a package that ships no models (appkit) — `makemigrations --check --dry-run`
+      # on an app with no models.py is a false-positive-free no-op, but skippable is cleaner
+      # than relying on that being true forever.
+      check-migrations:
+        type: boolean
+        default: true
+      # False for a package with no manage.py / no drf-spectacular dependency (appkit
+      # deliberately depends on neither — docs/CONTRACT.md §9, "deliberately not depended on").
+      check-openapi-schema:
+        type: boolean
+        default: true
+      # False alongside check-openapi-schema — no schema.yml means nothing to diff
+      # schema.d.ts against.
+      check-generated-types:
+        type: boolean
+        default: true
+      # Directory containing the npm workspace root package.json / package-lock.json that `npm
+      # ci` and its cache key resolve against. Most app packages keep this at "frontend" (the
+      # frontend/ dir IS the workspace root); appkit's package-lock.json lives at the repo root
+      # instead (root package.json declares `workspaces: ["frontend"]`, hoisting frontend/'s
+      # deps to a node_modules ancestor shared with tests/frontend/), so it passes ".".
+      npm-workspace-root:
+        type: string
+        default: "frontend"
+      # Newline-separated substrings, each asserted present in the built wheel's file list.
+      # Empty (default) skips the assertion loop entirely rather than passing vacuously.
+      wheel-must-contain:
+        type: string
+        default: ""
+      # True asserts frontend/package.json has NO "dependencies" key at all (not merely an
+      # empty one) — appkit-specific (docs/CONTRACT.md §22's zero-runtime-dependencies rule for
+      # its own SDK) but harmless for any package willing to hold itself to it.
+      forbid-runtime-dependencies:
+        type: boolean
+        default: false
+    secrets:
+      ORG_READ_TOKEN:
+        required: false # only needed if this app depends on a private shared toolkit
+
+jobs:
+  # ---------------------------------------------------------------- backend
+  backend-quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: backend/uv.lock
+          python-version: ${{ inputs.python-version }}
+      - run: uv sync --locked
+        working-directory: backend
+      # `.` alone silently skips ../tests (a sibling root, not a subdirectory of backend/) —
+      # every app package's tests live at the repo root (APP-DESIGN.md §2), so both paths are
+      # always checked together, not just backend/'s own src/.
+      - run: uv run ruff check --output-format=github . ../tests
+        working-directory: backend
+      - run: uv run ruff format --check . ../tests
+        working-directory: backend
+      - run: uv run mypy src
+        working-directory: backend
+
+  # Gate leg (docs/CONTRACT.md §9's two-leg strategy): every declared extra installed,
+  # authoritative coverage gate.
+  backend-tests:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: ${{ inputs.postgres-db }}
+        options: >-
+          --health-cmd pg_isready --health-interval 10s
+          --health-timeout 5s --health-retries 5
+        ports: ["5432:5432"]
+      redis:
+        image: ${{ inputs.needs-redis && 'redis:7-alpine' || '' }}
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 10s
+          --health-timeout 5s --health-retries 5
+        ports: ["6379:6379"]
+    env:
+      POSTGRES_HOST: localhost
+      POSTGRES_DB: ${{ inputs.postgres-db }}
+      REDIS_URL: redis://localhost:6379/0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: backend/uv.lock
+          python-version: ${{ inputs.python-version }}
+      - name: Build extra flags
+        id: extras
+        shell: bash
+        run: |
+          flags=""
+          for e in ${{ inputs.extras }}; do flags="$flags --extra $e"; done
+          echo "flags=$flags" >> "$GITHUB_OUTPUT"
+      - run: uv sync --locked ${{ steps.extras.outputs.flags }}
+        working-directory: backend
+      - name: Missing migrations check
+        if: ${{ inputs.check-migrations }}
+        run: uv run python -m django makemigrations --check --dry-run
+        working-directory: backend
+        env:
+          DJANGO_SETTINGS_MODULE: tests.backend.settings
+      # Same pattern as the migrations check above: the committed artifact must match what the
+      # code generates. Catches "serializer changed, schema.yml wasn't regenerated"
+      # (APP-DESIGN.md §12, "Generated types"). Skipped for a package with no OpenAPI schema at
+      # all (appkit — no manage.py, no drf-spectacular dependency by design).
+      - name: Committed schema.yml must match a fresh generation
+        if: ${{ inputs.check-openapi-schema }}
+        run: |
+          uv run python manage.py spectacular --file /tmp/schema.yml --fail-on-warn
+          diff -u schema.yml /tmp/schema.yml \
+            || { echo "::error::schema.yml is stale — run 'manage.py spectacular --file schema.yml' and commit it. See APP-DESIGN.md §12."; exit 1; }
+        working-directory: backend
+        env:
+          DJANGO_SETTINGS_MODULE: tests.backend.settings
+      - name: pytest
+        run: uv run pytest -n auto --cov-fail-under=${{ inputs.coverage-threshold }}
+        working-directory: backend
+
+  # Bare-install leg: proves the core stands alone with NEITHER extra present, and that a
+  # missing-extra ImportError is the actionable one (docs/CONTRACT.md §9). Skipped entirely for
+  # a package with no extras at all — the gate leg above already IS that package's only install.
+  backend-tests-bare:
+    if: ${{ inputs.extras != '' }}
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: ${{ inputs.postgres-db }}
+        options: >-
+          --health-cmd pg_isready --health-interval 10s
+          --health-timeout 5s --health-retries 5
+        ports: ["5432:5432"]
+    env:
+      POSTGRES_HOST: localhost
+      POSTGRES_DB: ${{ inputs.postgres-db }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: backend/uv.lock
+          python-version: ${{ inputs.python-version }}
+      # --exact matters: `uv run` syncs INEXACTLY by default, so without it a prior job's
+      # extras (if this runner's uv cache were ever shared, or in local reproduction of this
+      # job) would stay installed and this leg would silently run with both extras present
+      # anyway (docs/CONTRACT.md §9).
+      - run: uv sync --locked
+        working-directory: backend
+      - run: uv run --exact pytest -m "not requires_extra" --no-cov
+        working-directory: backend
+
+  # Proves the DECLARED ranges work, not just the locked versions — the ranges every other
+  # package resolves against (most load-bearing for a foundation package like appkit).
+  resolution-matrix:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        resolution: [lowest-direct, highest]
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env: { POSTGRES_PASSWORD: postgres, POSTGRES_DB: test_db }
+        options: >-
+          --health-cmd pg_isready --health-interval 10s
+          --health-timeout 5s --health-retries 5
+        ports: ["5432:5432"]
+    env:
+      POSTGRES_HOST: localhost
+      POSTGRES_DB: ${{ inputs.postgres-db }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+      - name: Build extra flags
+        id: extras
+        shell: bash
+        run: |
+          flags=""
+          for e in ${{ inputs.extras }}; do flags="$flags --extra $e"; done
+          echo "flags=$flags" >> "$GITHUB_OUTPUT"
+      - run: uv sync --resolution ${{ matrix.resolution }} --upgrade ${{ steps.extras.outputs.flags }}
+        working-directory: backend
+      - run: uv run pytest -n auto --no-cov
+        working-directory: backend
+
+  # Proves the built wheel actually contains what it claims to (py.typed, locale/, licence
+  # files, ...) — every entry named in `wheel-must-contain`. A missing py.typed is the most
+  # dangerous of these: it would silently strip every type hint from every consumer with no
+  # error anywhere.
+  wheel-smoke-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+      - run: uv build
+        working-directory: backend
+      - name: Install the wheel into a clean env and import it
+        working-directory: backend
+        run: |
+          uv venv /tmp/smoke
+          uv pip install --python /tmp/smoke/bin/python dist/*.whl
+          /tmp/smoke/bin/python -c "import ${{ inputs.package-name }}; print('import ok')"
+      - name: Assert wheel-must-contain entries are present
+        if: ${{ inputs.wheel-must-contain != '' }}
+        working-directory: backend
+        shell: bash
+        env:
+          WHEEL_MUST_CONTAIN: ${{ inputs.wheel-must-contain }}
+        run: |
+          python - <<'PY'
+          import glob, os, sys, zipfile
+          whl = glob.glob("dist/*.whl")[0]
+          names = zipfile.ZipFile(whl).namelist()
+          wanted = [line for line in os.environ["WHEEL_MUST_CONTAIN"].splitlines() if line.strip()]
+          missing = [w for w in wanted if not any(w in n for n in names)]
+          if missing:
+              sys.exit(f"wheel is missing required entries: {missing} — check MANIFEST.in / package-data")
+          print(f"wheel contains all {len(wanted)} required entries")
+          PY
+
+  security-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+      # --no-default-groups, NOT --no-dev: --no-dev only aliases --no-group dev and leaves the
+      # "test" group (pytest and friends) in the audited set.
+      # --no-hashes: with hashes present, pip-audit's internal pip install switches into
+      # hash-checking mode, which is fragile against uv.lock/PyPI hash drift — hash integrity is
+      # already uv's job via `uv sync --locked`.
+      # --all-extras: without it, extras-only dependencies (cryptography, pillow — kept optional
+      # specifically because of their advisory counts) are never in the audited set at all.
+      # `grep -v '^-e '` strips the self-referencing editable-install line `uv export` always
+      # emits for the project being exported — verified directly: without this, pip-audit hard-
+      # errors with "Dependency not found on PyPI and could not be audited: <package-name>",
+      # since the package under CI is (by definition) not yet published. This is a real
+      # dependency-of-nothing line, not a vulnerability to audit, for every app package this
+      # workflow runs against — not appkit-specific.
+      - run: uvx pip-audit --strict --no-deps -r <(uv export --locked --no-default-groups --all-extras --no-hashes --format requirements-txt | grep -v '^-e ')
+        shell: bash
+        working-directory: backend
+
+  # ---------------------------------------------------------------- frontend
+  frontend:
+    if: ${{ inputs.has-frontend }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+          cache-dependency-path: ${{ inputs.npm-workspace-root }}/package-lock.json
+      - run: npm ci
+        working-directory: ${{ inputs.npm-workspace-root }}
+      # Same "committed artifact must match a fresh generation" pattern as backend-tests'
+      # schema.yml check — needs only Node, so it lives here. Catches "schema.yml changed,
+      # schema.d.ts wasn't regenerated" (APP-DESIGN.md §12).
+      - name: Committed schema.d.ts must match a fresh generation
+        if: ${{ inputs.check-generated-types }}
+        run: |
+          npm run generate:types
+          git diff --exit-code src/schema.d.ts \
+            || { echo "::error::schema.d.ts is stale — run 'npm run generate:types' and commit it. See APP-DESIGN.md §12."; exit 1; }
+        working-directory: frontend
+      - name: package.json must declare no runtime dependencies
+        if: ${{ inputs.forbid-runtime-dependencies }}
+        run: |
+          node -e "
+            const pkg = require('./package.json');
+            if (Object.prototype.hasOwnProperty.call(pkg, 'dependencies')) {
+              console.error('::error::frontend/package.json has a \"dependencies\" key — this package must ship zero runtime dependencies. See APP-DESIGN.md §12 / CONTRACT.md §22.');
+              process.exit(1);
+            }
+          "
+        working-directory: frontend
+      - run: npx tsc --noEmit
+        working-directory: frontend
+      - run: npm run lint
+        working-directory: frontend
+      - run: npm run format:check
+        working-directory: frontend
+      - run: npm run test -- --run --coverage
+        working-directory: frontend
+      - run: npm audit --audit-level=high
+        working-directory: frontend
+      - run: npm run build
+        working-directory: frontend
+
+  # ---------------------------------------------------------------- contract gates
+  version-lockstep:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: pyproject, package.json and CHANGELOG must agree
+        run: |
+          PY=$(grep -m1 '^version' backend/pyproject.toml | sed 's/.*"\(.*\)"/\1/')
+          JS=$(node -p "require('./frontend/package.json').version")
+          # Anchored to the CHANGELOG's own version heading, NOT a bare numeric grep — an
+          # unanchored `grep -oE '[0-9]+\.[0-9]+\.[0-9]+'` matches the first x.y.z-shaped string
+          # in the file, which for a Keep a Changelog document is the changelog format's own
+          # "keepachangelog.com/en/1.1.0/" preamble link, producing a false mismatch on every
+          # release. Verified against this exact failure mode before landing this job.
+          CL=$(grep -m1 -oE '^## \[[0-9]+\.[0-9]+\.[0-9]+\]' CHANGELOG.md | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+          echo "pyproject=$PY package.json=$JS changelog=$CL"
+          test "$PY" = "$JS" && test "$PY" = "$CL" \
+            || { echo "::error::version mismatch — see APP-DESIGN.md §11"; exit 1; }
+      - name: On a tag, the tag must match too
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          PY=$(grep -m1 '^version' backend/pyproject.toml | sed 's/.*"\(.*\)"/\1/')
+          test "v$PY" = "${GITHUB_REF_NAME}" \
+            || { echo "::error::tag ${GITHUB_REF_NAME} != version v$PY"; exit 1; }
+
+  no-inter-app-imports:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Backstop grep for sibling app imports
+        run: |
+          if grep -rnE '^\s*(from|import)\s+[a-z_]+_app' backend/src \
+               --include='*.py' \
+               | grep -v '${{ inputs.package-name }}'; then
+            echo "::error::app package imports another app package — see APP-DESIGN.md §6"
+            exit 1
+          fi
+      - name: Factories must not be imported by production code
+        run: |
+          if grep -rn 'factories' backend/src --include='*.py' \
+               | grep -v 'factories.py'; then
+            echo "::error::factories.py is a test-only surface — see APP-DESIGN.md §7.3"
+            exit 1
+          fi
+      # The live rule for appkit specifically (its sibling-app set is empty, so the grep above
+      # is a no-op pass there): an app package must never import a host's internal modules
+      # (tools/core/config) — appkit itself IS what tools.* moves into, so importing back would
+      # also be circular (CLAUDE.md rule 2). Anchored so a legitimate `from django.conf import
+      # settings` never false-positives on the bare word "config".
+      - name: Backstop grep for host-module imports
+        run: |
+          if grep -rnE '^\s*(from|import)\s+(tools|core|config)(\.|$| )' backend/src \
+               --include='*.py'; then
+            echo "::error::app package imports a host module (tools/core/config) — see APP-DESIGN.md §4"
+            exit 1
+          fi
+
+  readme-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Every throttle_scope in code appears in README
+        run: |
+          fail=0
+          for scope in $(grep -rhoE 'throttle_scope\s*=\s*"[^"]+"' backend/src \
+                          | sed 's/.*"\(.*\)"/\1/' | sort -u); do
+            grep -q "$scope" README.md || { echo "::error::scope $scope missing from README"; fail=1; }
+          done
+          exit $fail
