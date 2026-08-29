@@ -87,6 +87,15 @@ on:
       forbid-runtime-dependencies:
         type: boolean
         default: false
+      # Publishes frontend/ to the npm registry on a v* tag push, via OIDC trusted publishing —
+      # no NPM_TOKEN anywhere. False by default: a package that ships its frontend half by git
+      # tag instead (most app packages — see INTEGRATION-GUIDE.md §2 step 4) never sets this.
+      # Requires a one-time manual bootstrap publish + a Trusted Publisher link on npmjs.com
+      # before the first tag that sets this true — trusted publishing can only be configured on
+      # a package that already exists on the registry.
+      publish-npm:
+        type: boolean
+        default: false
     secrets:
       ORG_READ_TOKEN:
         required: false # only needed if this app depends on a private shared toolkit
@@ -366,6 +375,48 @@ jobs:
       - run: npm audit --audit-level=high
         working-directory: frontend
       - run: npm run build
+        working-directory: frontend
+
+  # ---------------------------------------------------------------- publish
+  # Only on a v* tag, and only when the caller opts in with publish-npm: true — never on a plain
+  # push to main or a PR. id-token: write is what makes OIDC trusted publishing possible; there
+  # is no NPM_TOKEN anywhere in this job or this repo's secrets.
+  publish-npm:
+    if: ${{ inputs.publish-npm && startsWith(github.ref, 'refs/tags/v') }}
+    needs: [frontend]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          registry-url: https://registry.npmjs.org
+      - run: npm ci
+        working-directory: ${{ inputs.npm-workspace-root }}
+      # Skips cleanly, rather than failing, if this exact name@version is already on the
+      # registry — the release that bootstraps trusted publishing (see the publish-npm input's
+      # own comment) always hits this: the very first publish has to happen by hand, before
+      # trusted publishing can even be configured, and that hand publish is for the SAME version
+      # this tag is about to push. Without this check, that one release's tag push would always
+      # fail this job with npm's "cannot publish over previously published version" — the exact
+      # opposite of the "tag only after CI is green" workflow this exists to support.
+      - name: Skip if this version is already published
+        id: check
+        working-directory: frontend
+        run: |
+          NAME=$(node -p "require('./package.json').name")
+          VERSION=$(node -p "require('./package.json').version")
+          if npm view "$NAME@$VERSION" version >/dev/null 2>&1; then
+            echo "Already published: $NAME@$VERSION — skipping."
+            echo "already-published=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "already-published=false" >> "$GITHUB_OUTPUT"
+          fi
+      - run: npm publish --access public --provenance
+        if: steps.check.outputs.already-published == 'false'
         working-directory: frontend
 
   # ---------------------------------------------------------------- contract gates
