@@ -394,6 +394,12 @@ jobs:
         with:
           node-version: ${{ inputs.node-version }}
           registry-url: https://registry.npmjs.org
+      # node-version's default (22) bundles npm 10.9.x. Trusted publishing (OIDC, no NPM_TOKEN)
+      # requires npm >= 11.5.1 — without this, `npm publish` below fails with no OIDC support at
+      # all, found live: appkit's v1.0.1 tag never actually exercised this job for real (it hit
+      # the "already published" skip below every time, having been hand-published first), so this
+      # floor was never hit until a package's first genuine trusted-publish attempt.
+      - run: npm install -g npm@latest
       - run: npm ci
         working-directory: ${{ inputs.npm-workspace-root }}
       # Skips cleanly, rather than failing, if this exact name@version is already on the
