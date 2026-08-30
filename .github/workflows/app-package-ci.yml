@@ -507,3 +507,21 @@ jobs:
             grep -q "$scope" README.md || { echo "::error::scope $scope missing from README"; fail=1; }
           done
           exit $fail
+      # PyPI and npm each read a package's `readme` file relative to ITS OWN project root
+      # (backend/, frontend/), never the repo root two directories up — a monorepo publishing
+      # both halves needs a real, current copy of the root README in each, or the registry page
+      # shows no description at all (found live: appkit's v1.0.0 through v2.0.0 all shipped this
+      # way — PyPI's description and npm's readme were both empty). backend/README.md and
+      # frontend/README.md are therefore committed, generated COPIES, not hand-maintained prose
+      # — this step is the "committed artifact must match a fresh generation" pattern (§12)
+      # applied to READMEs instead of schema.yml/schema.d.ts.
+      - name: backend/README.md and frontend/README.md must mirror the root README.md
+        run: |
+          fail=0
+          diff -u README.md backend/README.md \
+            || { echo "::error::backend/README.md is stale — copy README.md over it and commit. See docs/APP-DESIGN.md §8."; fail=1; }
+          if [ "${{ inputs.has-frontend }}" = "true" ]; then
+            diff -u README.md frontend/README.md \
+              || { echo "::error::frontend/README.md is stale — copy README.md over it and commit. See docs/APP-DESIGN.md §8."; fail=1; }
+          fi
+          exit $fail
