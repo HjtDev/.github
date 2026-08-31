@@ -187,12 +187,20 @@ jobs:
           echo "flags=$flags" >> "$GITHUB_OUTPUT"
       - run: uv sync --locked ${{ steps.extras.outputs.flags }}
         working-directory: backend
+      # `python -m django`, unlike `manage.py`, does no sys.path setup of its own — a package
+      # whose tests/ tree lives at the repo root (one level above `backend/`, this workflow's
+      # working-directory) needs PYTHONPATH set explicitly here, mirroring the
+      # `pythonpath = ["src", ".."]` every such package already declares in its own
+      # `[tool.pytest.ini_options]` for pytest's benefit. Found live: cleanup_app's
+      # `backend-tests` job failed with `ModuleNotFoundError: No module named 'tests'` — appkit
+      # never caught this because it sets check-migrations: false (no models).
       - name: Missing migrations check
         if: ${{ inputs.check-migrations }}
         run: uv run python -m django makemigrations --check --dry-run
         working-directory: backend
         env:
           DJANGO_SETTINGS_MODULE: tests.backend.settings
+          PYTHONPATH: ..
       # Same pattern as the migrations check above: the committed artifact must match what the
       # code generates. Catches "serializer changed, schema.yml wasn't regenerated"
       # (APP-DESIGN.md §12, "Generated types"). Skipped for a package with no OpenAPI schema at
